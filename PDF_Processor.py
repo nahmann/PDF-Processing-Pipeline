@@ -10,14 +10,22 @@ Supports both AWS Textract and PyMuPDF for extraction.
 
 import os
 import re
-import boto3
 import fitz  # PyMuPDF
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
-from botocore.exceptions import ClientError, NoCredentialsError
 from langchain.text_splitter import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain.schema import Document
+
+# Optional imports for AWS Textract
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    TEXTRACT_AVAILABLE = True
+except ImportError:
+    TEXTRACT_AVAILABLE = False
+    ClientError = Exception
+    NoCredentialsError = Exception
 
 
 @dataclass
@@ -76,10 +84,10 @@ class PDFProcessor:
     def extract_with_textract(self, pdf_path: str) -> ProcessingResult:
         """
         Extract text from PDF using AWS Textract (synchronous processing).
-        
+
         Args:
             pdf_path: Path to the PDF file
-            
+
         Returns:
             ProcessingResult with extracted text and metadata
         """
@@ -88,10 +96,14 @@ class PDFProcessor:
             document_path=pdf_path,
             document_name=Path(pdf_path).name
         )
-        
+
+        if not TEXTRACT_AVAILABLE:
+            result.add_error("AWS Textract not available - boto3 not installed")
+            return result
+
         if self.debug:
             print(f"[DEBUG] Textract extraction for: {pdf_path}")
-        
+
         try:
             # Initialize Textract client if needed
             if self._textract_client is None:
@@ -172,12 +184,12 @@ class PDFProcessor:
     
     def extract_with_pymupdf(self, pdf_path: str, use_layout: bool = False) -> ProcessingResult:
         """
-        Extract text from PDF using PyMuPDF.
-        
+        Extract text from PDF using PyMuPDF with formatting metadata.
+
         Args:
             pdf_path: Path to the PDF file
             use_layout: If True, use block-based extraction for better paragraph detection
-            
+
         Returns:
             ProcessingResult with extracted text and metadata
         """
@@ -186,39 +198,39 @@ class PDFProcessor:
             document_path=pdf_path,
             document_name=Path(pdf_path).name
         )
-        
+
         if self.debug:
             print(f"[DEBUG] PyMuPDF extraction for: {pdf_path} (layout mode: {use_layout})")
-        
+
         try:
             # Check file exists
             pdf_file = Path(pdf_path)
             if not pdf_file.exists():
                 result.add_error(f"PDF file not found: {pdf_path}")
                 return result
-            
+
             file_size = pdf_file.stat().st_size
             file_size_mb = round(file_size / (1024 * 1024), 2)
             result.metadata['file_size_mb'] = file_size_mb
-            
+
             # Open the PDF document
             doc = fitz.open(pdf_path)
             text_parts = []
             page_count = doc.page_count
             page_text_map = {}  # Map to track which text came from which page
-            
+
             if self.debug:
                 print(f"[DEBUG] PDF opened. Pages: {page_count}")
-            
+
             for page_num in range(page_count):
                 page = doc[page_num]
                 page_start_pos = len(''.join(text_parts))
                 text_parts.append(f"\n--- Page {page_num + 1} ---\n")
-                
+
                 if use_layout:
                     # Block-based extraction for better paragraph preservation
                     blocks = page.get_text("blocks")
-                    
+
                     for block in blocks:
                         if block[6] == 0:  # Text block (not image)
                             block_text = block[4]
@@ -236,77 +248,430 @@ class PDFProcessor:
                 # Track page boundaries
                 page_end_pos = len(''.join(text_parts))
                 page_text_map[page_num + 1] = (page_start_pos, page_end_pos)
-            
+
             # Store page count before closing
             result.metadata['page_count'] = page_count
             result.metadata['page_text_map'] = page_text_map
-            
+
             # Close document
             doc.close()
-            
+
             # Now build the final text after document is closed
             result.extracted_text = ''.join(text_parts)
             result.metadata['extraction_method'] = 'pymupdf_layout' if use_layout else 'pymupdf_simple'
             result.success = True
-            
+
             if self.debug:
                 print(f"[DEBUG] Extraction successful: {len(result.extracted_text)} characters")
-        
+
         except Exception as e:
             result.add_error(f"Error processing PDF with PyMuPDF: {str(e)}")
             if self.debug:
                 print(f"[DEBUG] Exception: {str(e)}")
-        
+
         return result
-    
+
+    def extract_with_formatting(self, pdf_path: str) -> ProcessingResult:
+        """
+        Extract text from PDF with detailed formatting information for header detection.
+        Uses font properties (size, weight, flags) to identify headers.
+
+        Args:
+            pdf_path: Path to the PDF file
+
+        Returns:
+            ProcessingResult with extracted text and formatting metadata
+        """
+        result = ProcessingResult(
+            success=False,
+            document_path=pdf_path,
+            document_name=Path(pdf_path).name
+        )
+
+        if self.debug:
+            print(f"[DEBUG] Format-aware extraction for: {pdf_path}")
+
+        try:
+            # Check file exists
+            pdf_file = Path(pdf_path)
+            if not pdf_file.exists():
+                result.add_error(f"PDF file not found: {pdf_path}")
+                return result
+
+            file_size = pdf_file.stat().st_size
+            file_size_mb = round(file_size / (1024 * 1024), 2)
+            result.metadata['file_size_mb'] = file_size_mb
+
+            # Open the PDF document
+            doc = fitz.open(pdf_path)
+            page_count = doc.page_count
+
+            if self.debug:
+                print(f"[DEBUG] PDF opened. Pages: {page_count}")
+
+            # Extract text with formatting details
+            formatted_blocks = []
+
+            for page_num in range(page_count):
+                page = doc[page_num]
+
+                # Get text as dictionary with detailed formatting
+                text_dict = page.get_text("dict")
+
+                # Calculate font size statistics for this page to find headers
+                page_font_sizes = []
+                for block in text_dict.get("blocks", []):
+                    if block.get("type") == 0:
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                page_font_sizes.append(span.get("size", 0))
+
+                # Determine normal body font size (most common)
+                normal_font_size = max(set(page_font_sizes), key=page_font_sizes.count) if page_font_sizes else 11
+
+                for block in text_dict.get("blocks", []):
+                        if block.get("type") == 0:  # Text block
+                            for line in block.get("lines", []):
+                                line_text = ""
+                                # Track font properties for this line
+                                font_sizes = []
+                                font_flags = []
+
+                                for span in line.get("spans", []):
+                                    text = span.get("text", "")
+                                    line_text += text
+                                    font_sizes.append(span.get("size", 0))
+                                    font_flags.append(span.get("flags", 0))
+
+                                line_text = line_text.strip()
+                                if line_text:
+                                    # Calculate line properties
+                                    avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 0
+                                    # Check if bold (flag & 16) or if all uppercase
+                                    is_bold = any(flag & 16 for flag in font_flags)
+                                    is_all_caps = line_text.isupper() and len(line_text) > 3
+                                    is_larger = avg_font_size > normal_font_size
+                                    is_short = len(line_text) < 80  # Headers are typically short
+
+                                    # Improved header detection:
+                                    # 1. Bold + All Caps (like "CALL TO ORDER")
+                                    # 2. Bold + Larger font (like "1. Introduction and Purpose")
+                                    # 3. Bold + Short + Starts with number/letter (like "2. Employment Policies")
+                                    is_likely_header = (
+                                        (is_bold and is_all_caps) or
+                                        (is_bold and is_larger) or
+                                        (is_bold and is_short and re.match(r'^[\d\w]', line_text))
+                                    )
+
+                                    formatted_blocks.append({
+                                        'text': line_text,
+                                        'page': page_num + 1,
+                                        'font_size': avg_font_size,
+                                        'is_bold': is_bold,
+                                        'is_all_caps': is_all_caps,
+                                        'is_larger': is_larger,
+                                        'is_likely_header': is_likely_header
+                                    })
+
+                                    if self.debug and is_likely_header:
+                                        print(f"[DEBUG] Detected likely header on page {page_num + 1}: '{line_text[:60]}...'")
+
+            doc.close()
+
+            if self.debug:
+                print(f"[DEBUG] Extracted {len(formatted_blocks)} raw blocks")
+
+            # Reconstruct lines broken by PDF wrapping
+            formatted_blocks = self._reconstruct_wrapped_lines(formatted_blocks)
+
+            if self.debug:
+                print(f"[DEBUG] After line reconstruction: {len(formatted_blocks)} blocks")
+
+            # Store formatted blocks for later processing
+            result.metadata['formatted_blocks'] = formatted_blocks
+            result.metadata['page_count'] = page_count
+            result.metadata['extraction_method'] = 'pymupdf_formatted'
+
+            # Build plain text with header markers
+            text_parts = []
+            for block in formatted_blocks:
+                if block['is_likely_header']:
+                    text_parts.append(f"\n## {block['text']}\n")
+                else:
+                    text_parts.append(block['text'] + "\n")
+
+            result.extracted_text = ''.join(text_parts)
+            result.success = True
+
+            if self.debug:
+                print(f"[DEBUG] Format-aware extraction successful")
+                print(f"[DEBUG] Total blocks: {len(formatted_blocks)}")
+                header_count = sum(1 for b in formatted_blocks if b['is_likely_header'])
+                print(f"[DEBUG] Detected headers: {header_count}")
+
+        except Exception as e:
+            result.add_error(f"Error processing PDF with formatting extraction: {str(e)}")
+            if self.debug:
+                print(f"[DEBUG] Exception: {str(e)}")
+
+        return result
+
+    def _reconstruct_wrapped_lines(self, formatted_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Reconstruct lines that were broken by PDF line wrapping.
+        Merges continuation lines to prevent false header detection.
+
+        Args:
+            formatted_blocks: List of text blocks with formatting metadata
+
+        Returns:
+            List of blocks with wrapped lines merged
+        """
+        if not formatted_blocks:
+            return formatted_blocks
+
+        if self.debug:
+            print("[DEBUG] Reconstructing wrapped lines")
+
+        reconstructed = []
+        buffer = None
+
+        for block in formatted_blocks:
+            if buffer is None:
+                buffer = block.copy()
+                continue
+
+            # Check if current block should be merged with buffer
+            if self._should_merge_lines(buffer, block):
+                # Merge the lines
+                buffer['text'] += ' ' + block['text']
+
+                if self.debug:
+                    print(f"[DEBUG]   Merged: '{buffer['text'][:80]}...'")
+            else:
+                # Save buffer and start new one
+                # Re-evaluate header status after reconstruction
+                buffer = self._reevaluate_header_status(buffer)
+                reconstructed.append(buffer)
+                buffer = block.copy()
+
+        # Don't forget the last buffer
+        if buffer:
+            buffer = self._reevaluate_header_status(buffer)
+            reconstructed.append(buffer)
+
+        if self.debug:
+            merge_count = len(formatted_blocks) - len(reconstructed)
+            print(f"[DEBUG] Merged {merge_count} wrapped lines")
+
+        return reconstructed
+
+    def _should_merge_lines(self, prev: Dict[str, Any], curr: Dict[str, Any]) -> bool:
+        """
+        Determine if current line should be merged with previous line.
+
+        Merge if:
+        - Same page
+        - Same formatting (bold status, similar font size)
+        - Previous doesn't end with sentence terminator
+        - Current starts with continuation indicator
+        """
+        # Must be on same page
+        if prev['page'] != curr['page']:
+            return False
+
+        # Must have same bold status (don't merge header with content)
+        if prev['is_bold'] != curr['is_bold']:
+            return False
+
+        # Font size should be similar (within 1pt)
+        if abs(prev['font_size'] - curr['font_size']) > 1.0:
+            return False
+
+        prev_text = prev['text'].strip()
+        curr_text = curr['text'].strip()
+
+        # Don't merge if previous line is very short (likely a header)
+        if len(prev_text) < 15:
+            return False
+
+        # Check if previous line ends with sentence terminator
+        sentence_terminators = ('.', ':', '!', '?', ';')
+        if prev_text.endswith(sentence_terminators):
+            return False
+
+        # Check if current line starts with continuation markers
+        continuation_starts = (
+            curr_text[0].islower() if curr_text else False,
+            curr_text.startswith('and '),
+            curr_text.startswith('or '),
+            curr_text.startswith('the '),
+            curr_text.startswith('to '),
+            curr_text.startswith('of '),
+            curr_text.startswith('in '),
+            curr_text.startswith('for '),
+            curr_text.startswith('with ')
+        )
+
+        return any(continuation_starts)
+
+    def _reevaluate_header_status(self, block: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Re-evaluate if a block is a header after line reconstruction.
+        Uses multi-signal scoring for better accuracy.
+
+        Scoring criteria:
+        - MUST be bold OR all-caps (mandatory)
+        - THEN need 2+ additional signals from:
+          1. Larger font
+          2. Reasonable length (15-80 chars)
+          3. Ends with colon OR is short phrase
+          4. Not a list item pattern
+        """
+        text = block['text'].strip()
+
+        # MANDATORY: Must be bold OR all-caps
+        is_bold = block.get('is_bold', False)
+        is_all_caps = block.get('is_all_caps', False)
+
+        if not (is_bold or is_all_caps):
+            block['is_likely_header'] = False
+            block['header_score'] = 0
+            block['header_signals'] = []
+            return block
+
+        # Calculate additional signals
+        score = 0
+        reasons = []
+
+        # Signal 1: Larger font
+        if block.get('is_larger', False):
+            score += 1
+            reasons.append("larger")
+
+        # Signal 2: Reasonable header length (15-80 chars)
+        if 15 <= len(text) <= 80:
+            score += 1
+            reasons.append("good-length")
+
+        # Signal 3: Ends with colon OR is short standalone phrase
+        if text.endswith(':') or (len(text) < 40 and not ',' in text):
+            score += 1
+            reasons.append("header-pattern")
+
+        # Signal 4: NOT a list item (doesn't match common list patterns)
+        is_list_item = (
+            text.count(',') >= 2 or  # Has multiple commas (like "Name, Title, Dept")
+            re.match(r'^-\s+', text) or  # Starts with bullet dash
+            re.match(r'^\d+\)\s+', text) or  # Starts with 1) 2) etc
+            re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+,\s+', text)  # "First Last, Title" pattern
+        )
+        if not is_list_item:
+            score += 1
+            reasons.append("not-list")
+
+        # Require 2+ additional signals beyond bold/caps
+        is_header = score >= 2
+
+        # Add the mandatory signal to reasons
+        if is_bold:
+            reasons.insert(0, "bold")
+        if is_all_caps:
+            reasons.insert(0, "all-caps")
+
+        if self.debug and block.get('is_likely_header', False) != is_header:
+            status = "NOW HEADER" if is_header else "NO LONGER HEADER"
+            print(f"[DEBUG]   {status} (score {score}/4 + mandatory: {', '.join(reasons)}): '{text[:60]}'")
+
+        block['is_likely_header'] = is_header
+        block['header_score'] = score
+        block['header_signals'] = reasons
+
+        return block
+
+    def _is_sentence_complete(self, text: str) -> bool:
+        """
+        Check if text appears to be a complete sentence or standalone phrase.
+
+        Complete if:
+        - Ends with sentence terminator (. : ! ? ;)
+        - Is a short standalone phrase (< 40 chars and doesn't end with continuation word)
+        """
+        text = text.strip()
+
+        # Ends with sentence terminator
+        if text.endswith(('.', ':', '!', '?', ';')):
+            return True
+
+        # Short standalone phrase
+        if len(text) < 40:
+            continuation_endings = ('and', 'or', 'the', 'a', 'an', 'of', 'to', 'in', 'for', 'with', 'by')
+            words = text.lower().split()
+            if words and words[-1] not in continuation_endings:
+                return True
+
+        return False
+
     # ============================================================================
     # TEXT CLEANING METHODS
     # ============================================================================
     
-    def clean_text(self, text: str, validate: bool = True) -> Tuple[str, List[str]]:
+    def clean_text(self, text: str, validate: bool = True, formatted_blocks: Optional[List[Dict]] = None) -> Tuple[str, List[str]]:
         """
-        Clean and renumber legal document text.
-        
+        Clean and structure document text.
+
         Args:
             text: Raw extracted text
             validate: Whether to validate the cleaned output
-            
+            formatted_blocks: Optional formatting metadata from extract_with_formatting()
+
         Returns:
             Tuple of (cleaned_text, warnings)
         """
         if self.debug:
             print("[DEBUG] Starting text cleaning pipeline")
-        
+
         warnings = []
-        
+        original_text = text
+
         # Step 1: Remove page markers
         text = self._remove_page_markers(text)
-        
+
         # Step 2: Normalize whitespace
         text = self._normalize_whitespace(text)
-        
-        # Step 3: Parse document structure
-        sections = self._parse_sections(text)
-        
+
+        # Step 3: Parse document structure (try format-based first, then numbered)
+        if formatted_blocks:
+            if self.debug:
+                print("[DEBUG] Using format-based header detection")
+            sections = self._parse_formatted_sections(formatted_blocks)
+        else:
+            if self.debug:
+                print("[DEBUG] Attempting numbered section detection")
+            sections = self._parse_sections(text)
+
         if self.debug:
             print(f"[DEBUG] Parsed {len(sections)} main sections")
-        
+
         # Step 4: Check if we found any sections
-        if not sections or (len(sections) == 1 and not sections[0]['subsections']):
-            warnings.append("No numbered sections detected - document may not follow expected format")
+        if not sections or (len(sections) == 1 and not sections[0].get('subsections') and not sections[0].get('content')):
+            warnings.append("No structured sections detected - using minimal cleaning")
             if self.debug:
-                print("[DEBUG] WARNING: No structured sections found, using fallback chunking")
+                print("[DEBUG] WARNING: No structured sections found, using fallback")
             # Return the normalized text as-is for fallback chunking
             return text, warnings
 
-        # Step 5: Renumber sections
-        cleaned_text = self._renumber_sections(sections)
-        
+        # Step 5: Format sections into clean text
+        if formatted_blocks:
+            cleaned_text = self._format_formatted_sections(sections)
+        else:
+            cleaned_text = self._renumber_sections(sections)
+
         # Step 6: Validate if requested
         if validate:
-            validation_warnings = self._validate_cleaned_text(cleaned_text, sections)
+            validation_warnings = self._validate_cleaned_text(cleaned_text, original_text, sections)
             warnings.extend(validation_warnings)
-        
+
         if self.debug:
             print(f"[DEBUG] Cleaning complete. Warnings: {len(warnings)}")
 
@@ -447,6 +812,92 @@ class PDFProcessor:
             if re.match(r'^\d+\.', line):
                 return i
         return None
+
+    def _parse_formatted_sections(self, formatted_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Parse document into sections based on formatting metadata (bold + caps).
+
+        Args:
+            formatted_blocks: List of text blocks with formatting info
+
+        Returns:
+            List of section dictionaries
+        """
+        if self.debug:
+            print("[DEBUG] Parsing document using formatting metadata")
+
+        sections = []
+        current_section = None
+
+        for block in formatted_blocks:
+            text = block['text']
+
+            if block['is_likely_header']:
+                # This is a header - start new section
+                if current_section:
+                    sections.append(current_section)
+
+                current_section = {
+                    'type': 'section',
+                    'title': text,
+                    'content': [],
+                    'page': block['page']
+                }
+
+                if self.debug:
+                    print(f"[DEBUG] New section: '{text}'")
+
+            else:
+                # Regular content
+                if current_section:
+                    current_section['content'].append(text)
+                else:
+                    # Content before first header - create preamble section
+                    if not sections or sections[0]['title'] != 'PREAMBLE':
+                        current_section = {
+                            'type': 'section',
+                            'title': 'PREAMBLE',
+                            'content': [text],
+                            'page': block['page']
+                        }
+
+        # Add last section
+        if current_section:
+            sections.append(current_section)
+
+        if self.debug:
+            print(f"[DEBUG] Parsed {len(sections)} sections from formatting")
+
+        return sections
+
+    def _format_formatted_sections(self, sections: List[Dict[str, Any]]) -> str:
+        """
+        Format sections detected by formatting into clean text with markdown headers.
+
+        Args:
+            sections: List of section dictionaries from _parse_formatted_sections
+
+        Returns:
+            Formatted text string
+        """
+        if self.debug:
+            print("[DEBUG] Formatting sections into clean text")
+
+        output_lines = []
+
+        for section in sections:
+            # Section header as markdown
+            output_lines.append(f"## {section['title']}")
+            output_lines.append("")
+
+            # Section content
+            for content in section['content']:
+                if content.strip():
+                    output_lines.append(content)
+
+            output_lines.append("")
+
+        return '\n'.join(output_lines).strip()
     
     def _renumber_sections(self, sections: List[Dict[str, Any]]) -> str:
         """Renumber sections consistently and format output"""
@@ -492,33 +943,73 @@ class PDFProcessor:
         
         return '\n'.join(output_lines).strip()
     
-    def _validate_cleaned_text(self, cleaned_text: str, sections: List[Dict[str, Any]]) -> List[str]:
-        """Validate the cleaned text and return warnings"""
+    def _validate_cleaned_text(self, cleaned_text: str, original_text: str, sections: List[Dict[str, Any]]) -> List[str]:
+        """Validate the cleaned text and return warnings with structural checks"""
         warnings = []
-        
+
         # Check if we have sections
         if not sections:
             warnings.append("No sections were detected in the document")
             return warnings
-        
-        # Check for very short sections
+
+        # Check for significant content loss
+        orig_len = len(re.sub(r'\s', '', original_text))
+        clean_len = len(re.sub(r'\s', '', cleaned_text))
+
+        if orig_len > 0:
+            loss_pct = (1 - clean_len / orig_len) * 100
+            if loss_pct > 10:
+                warnings.append(f"Significant content loss detected: {loss_pct:.1f}%")
+            elif self.debug:
+                print(f"[DEBUG] Content preservation: {100 - loss_pct:.1f}%")
+
+        # Structural Validation: Check for suspiciously short sections
+        section_lengths = []
         for section in sections:
-            if not section['subsections'] and not section['content']:
-                warnings.append(f"Section '{section['title']}' appears empty")
-        
-        # Check section numbering continuity
-        expected_num = 1
+            title = section.get('title', '')
+            content = section.get('content', [])
+            total_text = title + ' '.join(content) if isinstance(content, list) else title + content
+            section_len = len(total_text)
+            section_lengths.append(section_len)
+
+            # Flag sections that are extremely short (< 20 chars = likely fragment)
+            if section_len < 20:
+                warnings.append(f"Suspiciously short section: '{title[:40]}' ({section_len} chars)")
+
+        # Structural Validation: Check section size distribution
+        if section_lengths:
+            import statistics
+            median_len = statistics.median(section_lengths)
+            max_len = max(section_lengths)
+
+            # Flag if largest section is 10x bigger than median (might have missed headers)
+            if median_len > 0 and max_len > 10 * median_len:
+                warnings.append(f"Uneven section sizes detected - largest is {max_len/median_len:.1f}x median (possible missed headers)")
+
+        # Check for very empty sections
         for section in sections:
-            actual_num = int(section['number'])
-            if actual_num != expected_num:
-                warnings.append(f"Section numbering gap: expected {expected_num}, found {actual_num}")
-            expected_num = actual_num + 1
-        
+            section_has_content = (
+                section.get('content') or
+                section.get('subsections') or
+                section.get('title')
+            )
+            if not section_has_content:
+                warnings.append(f"Section appears empty: {section.get('title', 'Unknown')}")
+
+        # Check section numbering continuity (only for numbered sections)
+        if sections and 'number' in sections[0]:
+            expected_num = 1
+            for section in sections:
+                actual_num = int(section['number'])
+                if actual_num != expected_num:
+                    warnings.append(f"Section numbering gap: expected {expected_num}, found {actual_num}")
+                expected_num = actual_num + 1
+
         if self.debug and warnings:
             print(f"[DEBUG] Validation found {len(warnings)} warnings:")
             for warning in warnings:
                 print(f"[DEBUG]   - {warning}")
-        
+
         return warnings
     
     # ============================================================================
@@ -593,17 +1084,75 @@ class PDFProcessor:
         return final_chunks
     
     def _convert_to_markdown(self, text: str) -> str:
-        """Convert numbered sections to markdown headers"""
-        # Main sections (1. Title) to ## headers
-        text = re.sub(r'^(\d+)\.\s+([A-Z][^\n]+)', r'## \1. \2', text, flags=re.MULTILINE)
-        
-        # Subsections (1.1 Title) to ### headers  
-        text = re.sub(r'^(\d+\.\d+)\.?\s+([A-Z][^\n]+)', r'### \1 \2', text, flags=re.MULTILINE)
-        
-        # Sub-subsections (1.1.1 Title) to #### headers
-        text = re.sub(r'^(\d+\.\d+\.\d+)\.?\s+([A-Z][^\n]+)', r'#### \1 \2', text, flags=re.MULTILINE)
-        
-        return text
+        """
+        Convert numbered sections to markdown headers.
+        Fixed to only match actual section headers, not content lines.
+        """
+        lines = text.split('\n')
+        output_lines = []
+
+        for line in lines:
+            # Check for sub-subsection (1.1.1)
+            match = re.match(r'^(\d+\.\d+\.\d+)\.?\s+(.+)$', line)
+            if match and self._is_likely_section_header(match.group(2)):
+                output_lines.append(f'#### {match.group(1)} {match.group(2)}')
+                continue
+
+            # Check for subsection (1.1)
+            match = re.match(r'^(\d+\.\d+)\.?\s+(.+)$', line)
+            if match and self._is_likely_section_header(match.group(2)):
+                output_lines.append(f'### {match.group(1)} {match.group(2)}')
+                continue
+
+            # Check for main section (1.)
+            match = re.match(r'^(\d+)\.\s+(.+)$', line)
+            if match and self._is_likely_section_header(match.group(2)):
+                output_lines.append(f'## {match.group(1)}. {match.group(2)}')
+                continue
+
+            # Check if line already has markdown header (from formatting extraction)
+            if line.startswith('##'):
+                output_lines.append(line)
+                continue
+
+            # Regular line - keep as is
+            output_lines.append(line)
+
+        return '\n'.join(output_lines)
+
+    def _is_likely_section_header(self, text: str) -> bool:
+        """
+        Heuristic to determine if text is likely a section header vs content.
+
+        A line is likely a header if:
+        - Starts with capital letter
+        - Is relatively short (< 100 chars)
+        - Doesn't end with continuation indicators
+        - Ideally title-cased
+        """
+        text = text.strip()
+
+        if not text:
+            return False
+
+        # Must start with capital
+        if not text[0].isupper():
+            return False
+
+        # Too long to be a header
+        if len(text) > 100:
+            return False
+
+        # Ends with continuation (likely incomplete sentence from content)
+        if text.endswith((',', 'and', 'or', 'the', 'a', 'an', 'of', 'to', 'in')):
+            return False
+
+        # Contains common sentence continuations
+        lowered = text.lower()
+        if any(lowered.endswith(word) for word in ['applicable to', 'conditions', 'procedures', 'including']):
+            return False
+
+        return True
     
     def _split_large_chunk(self, text: str, base_metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Split a chunk that exceeds max_chunk_size"""
@@ -675,20 +1224,20 @@ class PDFProcessor:
     # PIPELINE METHODS
     # ============================================================================
     
-    def process_single_pdf(self, 
+    def process_single_pdf(self,
                           pdf_path: str,
-                          extraction_method: str = 'pymupdf',
+                          extraction_method: str = 'formatting',
                           use_layout: bool = False,
                           document_title: Optional[str] = None) -> ProcessingResult:
         """
         Complete pipeline for a single PDF.
-        
+
         Args:
             pdf_path: Path to PDF file
-            extraction_method: 'pymupdf' or 'textract'
-            use_layout: Use layout-aware extraction (PyMuPDF only)
+            extraction_method: 'formatting', 'pymupdf', or 'textract'
+            use_layout: Use layout-aware extraction (PyMuPDF only, ignored if formatting)
             document_title: Optional title for metadata
-            
+
         Returns:
             ProcessingResult with complete processing information
         """
@@ -696,21 +1245,26 @@ class PDFProcessor:
             print(f"\n{'='*80}")
             print(f"PROCESSING: {Path(pdf_path).name}")
             print(f"{'='*80}")
-        
+
         # Extract text
         if extraction_method.lower() == 'textract':
             result = self.extract_with_textract(pdf_path)
+            formatted_blocks = None
+        elif extraction_method.lower() == 'formatting':
+            result = self.extract_with_formatting(pdf_path)
+            formatted_blocks = result.metadata.get('formatted_blocks')
         else:
             result = self.extract_with_pymupdf(pdf_path, use_layout)
-        
+            formatted_blocks = None
+
         if not result.success:
             return result
-        
+
         # Clean text
-        cleaned_text, warnings = self.clean_text(result.extracted_text)
+        cleaned_text, warnings = self.clean_text(result.extracted_text, formatted_blocks=formatted_blocks)
         result.cleaned_text = cleaned_text
         result.warnings.extend(warnings)
-        
+
         # Chunk text
         try:
             title = document_title or Path(pdf_path).stem
@@ -719,19 +1273,19 @@ class PDFProcessor:
             result.metadata['chunk_count'] = len(chunks)
         except Exception as e:
             result.add_error(f"Chunking failed: {str(e)}")
-        
+
         if self.debug:
             print(f"\n[DEBUG] Processing complete for {result.document_name}")
             print(f"[DEBUG] Success: {result.success}")
             print(f"[DEBUG] Errors: {len(result.errors)}")
             print(f"[DEBUG] Warnings: {len(result.warnings)}")
             print(f"[DEBUG] Chunks: {len(result.chunks)}")
-        
+
         return result
     
     def process_directory(self,
                          directory_path: str,
-                         extraction_method: str = 'pymupdf',
+                         extraction_method: str = 'formatting',
                          use_layout: bool = False,
                          recursive: bool = True) -> List[ProcessingResult]:
         """
@@ -795,7 +1349,7 @@ class PDFProcessor:
     # UTILITY METHODS
     # ============================================================================
     
-    def _initialize_textract_client(self) -> boto3.client:
+    def _initialize_textract_client(self):
         """Initialize AWS Textract client"""
         if self.debug:
             print(f"[DEBUG] Initializing Textract client (region: {self.aws_region})")
