@@ -205,12 +205,14 @@ class PDFProcessor:
             doc = fitz.open(pdf_path)
             text_parts = []
             page_count = doc.page_count
+            page_text_map = {}  # Map to track which text came from which page
             
             if self.debug:
                 print(f"[DEBUG] PDF opened. Pages: {page_count}")
             
             for page_num in range(page_count):
                 page = doc[page_num]
+                page_start_pos = len(''.join(text_parts))
                 text_parts.append(f"\n--- Page {page_num + 1} ---\n")
                 
                 if use_layout:
@@ -230,9 +232,14 @@ class PDFProcessor:
                     page_text = page.get_text()
                     text_parts.append(page_text)
                     text_parts.append("\n")
+
+                # Track page boundaries
+                page_end_pos = len(''.join(text_parts))
+                page_text_map[page_num + 1] = (page_start_pos, page_end_pos)
             
             # Store page count before closing
             result.metadata['page_count'] = page_count
+            result.metadata['page_text_map'] = page_text_map
             
             # Close document
             doc.close()
@@ -284,17 +291,25 @@ class PDFProcessor:
         if self.debug:
             print(f"[DEBUG] Parsed {len(sections)} main sections")
         
-        # Step 4: Renumber sections
+        # Step 4: Check if we found any sections
+        if not sections or (len(sections) == 1 and not sections[0]['subsections']):
+            warnings.append("No numbered sections detected - document may not follow expected format")
+            if self.debug:
+                print("[DEBUG] WARNING: No structured sections found, using fallback chunking")
+            # Return the normalized text as-is for fallback chunking
+            return text, warnings
+
+        # Step 5: Renumber sections
         cleaned_text = self._renumber_sections(sections)
         
-        # Step 5: Validate if requested
+        # Step 6: Validate if requested
         if validate:
             validation_warnings = self._validate_cleaned_text(cleaned_text, sections)
             warnings.extend(validation_warnings)
         
         if self.debug:
             print(f"[DEBUG] Cleaning complete. Warnings: {len(warnings)}")
-        
+
         return cleaned_text, warnings
     
     def _remove_page_markers(self, text: str) -> str:
@@ -795,6 +810,40 @@ class PDFProcessor:
         except Exception as e:
             raise Exception(f"Failed to initialize Textract client: {str(e)}")
 
+    @staticmethod
+    def get_random_pdf(directory: str, n: int = 1, seed: Optional[int] = None) -> List[str]:
+        """
+        Get random PDF(s) from a directory tree.
+        
+        Args:
+            directory: Root directory to search
+            n: Number of random PDFs to return
+            seed: Random seed for reproducibility
+            
+        Returns:
+            List of paths to randomly selected PDFs
+        """
+        import random
+        
+        if seed is not None:
+            random.seed(seed)
+        
+        # Find all PDFs recursively
+        directory_path = Path(directory)
+        if not directory_path.exists():
+            raise FileNotFoundError(f"Directory not found: {directory}")
+        
+        all_pdfs = list(directory_path.rglob("*.pdf"))
+        
+        if not all_pdfs:
+            raise ValueError(f"No PDF files found in {directory}")
+        
+        # Return n random PDFs
+        n = min(n, len(all_pdfs))
+        selected = random.sample(all_pdfs, n)
+        
+        return [str(pdf) for pdf in selected]
+
 
 # ============================================================================
 # MAIN / TEST FUNCTIONS
@@ -933,20 +982,106 @@ def main():
     # print("="*80)
 
 
+def test_random_pdfs(directory: str, n: int = 3):
+    """Test the processor on random PDFs from a directory"""
+    
+    print("\n" + "="*80)
+    print(f"TESTING ON {n} RANDOM PDFs")
+    print("="*80)
+    
+    # Get random PDFs
+    try:
+        random_pdfs = PDFProcessor.get_random_pdf(directory, n=n, seed=42)
+        print(f"\nSelected {len(random_pdfs)} random PDFs:")
+        for pdf in random_pdfs:
+            print(f"  - {Path(pdf).name}")
+    except Exception as e:
+        print(f"Error selecting random PDFs: {e}")
+        return
+    
+    # Initialize processor
+    processor = PDFProcessor(
+        max_chunk_size=2000,
+        chunk_overlap=200,
+        debug=True
+    )
+    
+    # Process each PDF
+    results = []
+    for i, pdf_path in enumerate(random_pdfs, 1):
+        print(f"\n{'='*80}")
+        print(f"RANDOM TEST {i}/{len(random_pdfs)}: {Path(pdf_path).name}")
+        print(f"{'='*80}")
+        
+        result = processor.process_single_pdf(
+            pdf_path,
+            extraction_method='pymupdf',
+            use_layout=False
+        )
+        results.append(result)
+        
+        print(f"\nResults for {Path(pdf_path).name}:")
+        print(f"  Success: {result.success}")
+        print(f"  Pages: {result.metadata.get('page_count', 'N/A')}")
+        print(f"  Chunks: {len(result.chunks)}")
+        print(f"  Errors: {len(result.errors)}")
+        print(f"  Warnings: {len(result.warnings)}")
+        
+        if result.errors:
+            print("\n  Errors:")
+            for error in result.errors:
+                print(f"    - {error}")
+        
+        if result.warnings:
+            print("\n  Warnings:")
+            for warning in result.warnings[:5]:  # Show first 5
+                print(f"    - {warning}")
+        
+        if result.chunks:
+            print("\n  Sample chunk:")
+            chunk = result.chunks[0]
+            print(f"    Size: {chunk['chunk_size']} chars")
+            if 'start_page' in chunk['metadata']:
+                print(f"    Pages: {chunk['metadata']['start_page']}-{chunk['metadata']['end_page']}")
+            print(f"    Metadata keys: {list(chunk['metadata'].keys())}")
+            print(f"    Text preview: {chunk['text'][:100]}...")
+    
+    # Summary
+    print("\n" + "="*80)
+    print("RANDOM TESTING SUMMARY")
+    print("="*80)
+    successful = sum(1 for r in results if r.success)
+    total_chunks = sum(len(r.chunks) for r in results)
+    print(f"Total PDFs tested: {len(results)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {len(results) - successful}")
+    print(f"Total chunks created: {total_chunks}")
+    if successful > 0:
+        print(f"Average chunks per document: {total_chunks / successful:.1f}")
+    print("="*80)
+
+
 if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # Note: final paragraph assumption of main header didnt work properly. Decided that a subsection was a main section because of it I think
+    import sys
+    
+    # Check if user wants random testing
+    if len(sys.argv) > 1 and sys.argv[1] == "--random":
+        script_dir = Path(__file__).parent.resolve()
+        pdf_directory = script_dir / "pdfs"
+        
+        n_samples = 3
+        if len(sys.argv) > 2:
+            try:
+                n_samples = int(sys.argv[2])
+            except ValueError:
+                print("Invalid number of samples, using default (3)")
+        
+        if not pdf_directory.exists():
+            print(f"Error: PDF directory not found: {pdf_directory}")
+            print("Please create a 'pdfs' folder in the same directory as this script")
+            sys.exit(1)
+        
+        test_random_pdfs(str(pdf_directory), n=n_samples)
+    else:
+        # Run standard test suite
+        main()
