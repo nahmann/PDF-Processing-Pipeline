@@ -199,9 +199,6 @@ class PDFProcessor:
             document_name=Path(pdf_path).name
         )
 
-        if self.debug:
-            print(f"[DEBUG] PyMuPDF extraction for: {pdf_path} (layout mode: {use_layout})")
-
         try:
             # Check file exists
             pdf_file = Path(pdf_path)
@@ -218,9 +215,6 @@ class PDFProcessor:
             text_parts = []
             page_count = doc.page_count
             page_text_map = {}  # Map to track which text came from which page
-
-            if self.debug:
-                print(f"[DEBUG] PDF opened. Pages: {page_count}")
 
             for page_num in range(page_count):
                 page = doc[page_num]
@@ -261,9 +255,6 @@ class PDFProcessor:
             result.metadata['extraction_method'] = 'pymupdf_layout' if use_layout else 'pymupdf_simple'
             result.success = True
 
-            if self.debug:
-                print(f"[DEBUG] Extraction successful: {len(result.extracted_text)} characters")
-
         except Exception as e:
             result.add_error(f"Error processing PDF with PyMuPDF: {str(e)}")
             if self.debug:
@@ -288,9 +279,6 @@ class PDFProcessor:
             document_name=Path(pdf_path).name
         )
 
-        if self.debug:
-            print(f"[DEBUG] Format-aware extraction for: {pdf_path}")
-
         try:
             # Check file exists
             pdf_file = Path(pdf_path)
@@ -305,9 +293,6 @@ class PDFProcessor:
             # Open the PDF document
             doc = fitz.open(pdf_path)
             page_count = doc.page_count
-
-            if self.debug:
-                print(f"[DEBUG] PDF opened. Pages: {page_count}")
 
             # Extract text with formatting details
             formatted_blocks = []
@@ -373,19 +358,12 @@ class PDFProcessor:
                                         'is_likely_header': is_likely_header
                                     })
 
-                                    if self.debug and is_likely_header:
-                                        print(f"[DEBUG] Detected likely header on page {page_num + 1}: '{line_text[:60]}...'")
+                                    # Skip verbose debug output during initial detection
 
             doc.close()
 
-            if self.debug:
-                print(f"[DEBUG] Extracted {len(formatted_blocks)} raw blocks")
-
             # Reconstruct lines broken by PDF wrapping
             formatted_blocks = self._reconstruct_wrapped_lines(formatted_blocks)
-
-            if self.debug:
-                print(f"[DEBUG] After line reconstruction: {len(formatted_blocks)} blocks")
 
             # Store formatted blocks for later processing
             result.metadata['formatted_blocks'] = formatted_blocks
@@ -404,10 +382,18 @@ class PDFProcessor:
             result.success = True
 
             if self.debug:
-                print(f"[DEBUG] Format-aware extraction successful")
-                print(f"[DEBUG] Total blocks: {len(formatted_blocks)}")
-                header_count = sum(1 for b in formatted_blocks if b['is_likely_header'])
-                print(f"[DEBUG] Detected headers: {header_count}")
+                # Show clear summary of detected headers
+                headers = [b for b in formatted_blocks if b['is_likely_header']]
+                print(f"\n{'='*80}")
+                print(f"DETECTED {len(headers)} HEADERS:")
+                print(f"{'='*80}")
+                for idx, h in enumerate(headers, 1):
+                    page = h['page']
+                    text = h['text']
+                    # Truncate long headers
+                    display_text = text if len(text) <= 70 else text[:67] + "..."
+                    print(f"  [{idx:2d}] Page {page}: {display_text}")
+                print(f"{'='*80}\n")
 
         except Exception as e:
             result.add_error(f"Error processing PDF with formatting extraction: {str(e)}")
@@ -430,9 +416,6 @@ class PDFProcessor:
         if not formatted_blocks:
             return formatted_blocks
 
-        if self.debug:
-            print("[DEBUG] Reconstructing wrapped lines")
-
         reconstructed = []
         buffer = None
 
@@ -445,9 +428,6 @@ class PDFProcessor:
             if self._should_merge_lines(buffer, block):
                 # Merge the lines
                 buffer['text'] += ' ' + block['text']
-
-                if self.debug:
-                    print(f"[DEBUG]   Merged: '{buffer['text'][:80]}...'")
             else:
                 # Save buffer and start new one
                 # Re-evaluate header status after reconstruction
@@ -459,10 +439,6 @@ class PDFProcessor:
         if buffer:
             buffer = self._reevaluate_header_status(buffer)
             reconstructed.append(buffer)
-
-        if self.debug:
-            merge_count = len(formatted_blocks) - len(reconstructed)
-            print(f"[DEBUG] Merged {merge_count} wrapped lines")
 
         return reconstructed
 
@@ -579,9 +555,7 @@ class PDFProcessor:
         if is_all_caps:
             reasons.insert(0, "all-caps")
 
-        if self.debug and block.get('is_likely_header', False) != is_header:
-            status = "NOW HEADER" if is_header else "NO LONGER HEADER"
-            print(f"[DEBUG]   {status} (score {score}/4 + mandatory: {', '.join(reasons)}): '{text[:60]}'")
+        # Skip verbose re-evaluation debug output
 
         block['is_likely_header'] = is_header
         block['header_score'] = score
@@ -628,9 +602,6 @@ class PDFProcessor:
         Returns:
             Tuple of (cleaned_text, warnings)
         """
-        if self.debug:
-            print("[DEBUG] Starting text cleaning pipeline")
-
         warnings = []
         original_text = text
 
@@ -642,16 +613,9 @@ class PDFProcessor:
 
         # Step 3: Parse document structure (try format-based first, then numbered)
         if formatted_blocks:
-            if self.debug:
-                print("[DEBUG] Using format-based header detection")
             sections = self._parse_formatted_sections(formatted_blocks)
         else:
-            if self.debug:
-                print("[DEBUG] Attempting numbered section detection")
             sections = self._parse_sections(text)
-
-        if self.debug:
-            print(f"[DEBUG] Parsed {len(sections)} main sections")
 
         # Step 4: Check if we found any sections
         if not sections or (len(sections) == 1 and not sections[0].get('subsections') and not sections[0].get('content')):
@@ -672,22 +636,14 @@ class PDFProcessor:
             validation_warnings = self._validate_cleaned_text(cleaned_text, original_text, sections)
             warnings.extend(validation_warnings)
 
-        if self.debug:
-            print(f"[DEBUG] Cleaning complete. Warnings: {len(warnings)}")
-
         return cleaned_text, warnings
     
     def _remove_page_markers(self, text: str) -> str:
         """Remove page break markers like '--- Page N ---'"""
-        if self.debug:
-            print("[DEBUG] Removing page markers")
         return re.sub(r'-+\s*Page\s+\d+\s*-+\s*\n', '', text, flags=re.IGNORECASE)
-    
+
     def _normalize_whitespace(self, text: str) -> str:
         """Normalize excessive whitespace while preserving structure"""
-        if self.debug:
-            print("[DEBUG] Normalizing whitespace")
-        
         # Collapse multiple spaces to single space
         text = re.sub(r' +', ' ', text)
         # Limit consecutive newlines to 2
@@ -699,14 +655,11 @@ class PDFProcessor:
     def _parse_sections(self, text: str) -> List[Dict[str, Any]]:
         """
         Parse document into hierarchical sections using simplified logic.
-        
+
         Simplified heuristic:
         - A numbered line is a main section if the next numbered line starts with '1.'
         - Otherwise it's a subsection
         """
-        if self.debug:
-            print("[DEBUG] Parsing document structure")
-        
         lines = text.split('\n')
         sections = []
         current_section = None
@@ -760,9 +713,6 @@ class PDFProcessor:
                             'content': []
                         }
                         current_subsection = None
-                        
-                        if self.debug:
-                            print(f"[DEBUG] Main section: {main_num}. {content[:50]}")
                     else:
                         # This is actually a subsection that wasn't formatted as X.Y
                         if current_section:
@@ -777,10 +727,7 @@ class PDFProcessor:
                             'bullets': []
                         }
                         current_section['subsections'].append(current_subsection)
-                        
-                        if self.debug:
-                            print(f"[DEBUG]   Subsection: {main_num}.{sub_num} {content[:50]}")
-            
+
             elif line.startswith('-'):
                 # Bullet point
                 bullet_text = line[1:].strip()
@@ -823,9 +770,6 @@ class PDFProcessor:
         Returns:
             List of section dictionaries
         """
-        if self.debug:
-            print("[DEBUG] Parsing document using formatting metadata")
-
         sections = []
         current_section = None
 
@@ -843,9 +787,6 @@ class PDFProcessor:
                     'content': [],
                     'page': block['page']
                 }
-
-                if self.debug:
-                    print(f"[DEBUG] New section: '{text}'")
 
             else:
                 # Regular content
@@ -865,9 +806,6 @@ class PDFProcessor:
         if current_section:
             sections.append(current_section)
 
-        if self.debug:
-            print(f"[DEBUG] Parsed {len(sections)} sections from formatting")
-
         return sections
 
     def _format_formatted_sections(self, sections: List[Dict[str, Any]]) -> str:
@@ -880,9 +818,6 @@ class PDFProcessor:
         Returns:
             Formatted text string
         """
-        if self.debug:
-            print("[DEBUG] Formatting sections into clean text")
-
         output_lines = []
 
         for section in sections:
@@ -898,12 +833,9 @@ class PDFProcessor:
             output_lines.append("")
 
         return '\n'.join(output_lines).strip()
-    
+
     def _renumber_sections(self, sections: List[Dict[str, Any]]) -> str:
         """Renumber sections consistently and format output"""
-        if self.debug:
-            print("[DEBUG] Renumbering sections")
-        
         output_lines = []
         
         for main_idx, section in enumerate(sections, 1):
@@ -960,8 +892,6 @@ class PDFProcessor:
             loss_pct = (1 - clean_len / orig_len) * 100
             if loss_pct > 10:
                 warnings.append(f"Significant content loss detected: {loss_pct:.1f}%")
-            elif self.debug:
-                print(f"[DEBUG] Content preservation: {100 - loss_pct:.1f}%")
 
         # Structural Validation: Check for suspiciously short sections
         section_lengths = []
@@ -1005,11 +935,6 @@ class PDFProcessor:
                     warnings.append(f"Section numbering gap: expected {expected_num}, found {actual_num}")
                 expected_num = actual_num + 1
 
-        if self.debug and warnings:
-            print(f"[DEBUG] Validation found {len(warnings)} warnings:")
-            for warning in warnings:
-                print(f"[DEBUG]   - {warning}")
-
         return warnings
     
     # ============================================================================
@@ -1027,9 +952,6 @@ class PDFProcessor:
         Returns:
             List of chunks with metadata
         """
-        if self.debug:
-            print("[DEBUG] Starting document chunking")
-        
         # Convert to markdown headers
         markdown_text = self._convert_to_markdown(cleaned_text)
         
@@ -1047,10 +969,7 @@ class PDFProcessor:
         
         # Split by headers
         header_chunks = markdown_splitter.split_text(markdown_text)
-        
-        if self.debug:
-            print(f"[DEBUG] Created {len(header_chunks)} header-based chunks")
-        
+
         # Process each chunk
         final_chunks = []
         
@@ -1075,12 +994,7 @@ class PDFProcessor:
         
         # Add hierarchical context
         final_chunks = self._add_section_hierarchy(final_chunks)
-        
-        if self.debug:
-            print(f"[DEBUG] Final chunk count: {len(final_chunks)}")
-            avg_size = sum(c['chunk_size'] for c in final_chunks) / len(final_chunks)
-            print(f"[DEBUG] Average chunk size: {avg_size:.0f} characters")
-        
+
         return final_chunks
     
     def _convert_to_markdown(self, text: str) -> str:
@@ -1214,10 +1128,7 @@ class PDFProcessor:
                 metadata=chunk["metadata"]
             )
             documents.append(doc)
-        
-        if self.debug:
-            print(f"[DEBUG] Created {len(documents)} LangChain documents")
-        
+
         return documents
     
     # ============================================================================
@@ -1244,7 +1155,7 @@ class PDFProcessor:
         if self.debug:
             print(f"\n{'='*80}")
             print(f"PROCESSING: {Path(pdf_path).name}")
-            print(f"{'='*80}")
+            print(f"{'='*80}\n")
 
         # Extract text
         if extraction_method.lower() == 'textract':
@@ -1275,11 +1186,22 @@ class PDFProcessor:
             result.add_error(f"Chunking failed: {str(e)}")
 
         if self.debug:
-            print(f"\n[DEBUG] Processing complete for {result.document_name}")
-            print(f"[DEBUG] Success: {result.success}")
-            print(f"[DEBUG] Errors: {len(result.errors)}")
-            print(f"[DEBUG] Warnings: {len(result.warnings)}")
-            print(f"[DEBUG] Chunks: {len(result.chunks)}")
+            # Print summary
+            print(f"\n{'='*80}")
+            print(f"SUMMARY FOR: {result.document_name}")
+            print(f"{'='*80}")
+            print(f"Success: {result.success}")
+            print(f"Pages: {result.metadata.get('page_count', 'N/A')}")
+            print(f"Chunks created: {len(result.chunks)}")
+            if result.errors:
+                print(f"Errors: {len(result.errors)}")
+                for err in result.errors:
+                    print(f"  - {err}")
+            if result.warnings:
+                print(f"Warnings: {len(result.warnings)}")
+                for warn in result.warnings[:3]:  # Show first 3
+                    print(f"  - {warn}")
+            print(f"{'='*80}\n")
 
         return result
     
@@ -1351,13 +1273,8 @@ class PDFProcessor:
     
     def _initialize_textract_client(self):
         """Initialize AWS Textract client"""
-        if self.debug:
-            print(f"[DEBUG] Initializing Textract client (region: {self.aws_region})")
-        
         try:
             client = boto3.client('textract', region_name=self.aws_region)
-            if self.debug:
-                print("[DEBUG] Textract client initialized successfully")
             return client
         except NoCredentialsError:
             raise Exception("AWS credentials not found. Please configure AWS credentials.")
